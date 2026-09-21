@@ -1,0 +1,17 @@
+{
+  "name": "clock-stability-service",
+  "version": "1.0.0",
+  "description": "Overlapping Allan variance stability curve and noise-segment identification service",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "express": "^4.21.0"
+  }
+}
