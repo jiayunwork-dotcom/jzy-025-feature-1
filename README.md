@@ -12,7 +12,7 @@ Node.js 20 + Express，记录段写入进程内 SQLite（better-sqlite3），
 
 ```bash
 npm install
-npm test          # node --test，23 个自动化测试
+npm test          # node --test，46 个自动化测试
 npm start         # 默认 :3000，DB 在 ./data/records.db
 
 # 环境变量
@@ -34,6 +34,11 @@ docker run --rm -p 3000:3000 -v "$PWD/data:/app/data" clock-stability
 | POST | `/records` | 提交记录段。成功 `201`；入参不合法或候选 τ 全超 T/3 时 `422`，记录进失败态并写明原因 |
 | GET | `/records` | 摘要列表：点数、τ0、是否识别出白频率段（不含序列与曲线） |
 | GET | `/records/:id` | 按记录号取回全文 |
+| POST | `/sources` | 开“来源”：钉死采样间隔 τ0 与数据类型 kind |
+| POST | `/sources/:id/batches` | 向来源追加一批；同一来源串行追加，并发 `409` |
+| GET | `/sources` | 来源摘要列表（覆盖长度、批次数、残缺段；不含样本与点位） |
+| GET | `/sources/:id/summary` | 单个来源摘要 |
+| GET | `/sources/:id` | 来源全文：联合曲线各 τ 点的稳度值与噪声标签 |
 | GET | `/health` | 存活检查与预置记录号 |
 
 提交体：
@@ -55,6 +60,61 @@ docker run --rm -p 3000:3000 -v "$PWD/data:/app/data" clock-stability
 每个点的 `{m, tau, sigma, slope, noiseCode, noiseLabel}`、本次使用的
 `slopeBands`、`hasWhiteFrequency`。失败记录只有 `status: "failed"` 与
 `failureReason`，绝不附带假曲线。
+
+## 分批来源（同一物理来源连续采集）
+
+真实设备连续运行、每隔一段时间导出一批，中间可能因维护/断电/换机
+断开多次。来源让调用方声明“这些批次属于同一个物理来源、按时间顺序
+连续采集”，服务把所有**已成功批次当成一整条不间断序列**重算联合
+稳定度曲线，而不是把每批各自的曲线拼接。
+
+开来源时钉死一次 `tau0` / `kind`，之后每批只需提交 `samples`
+（显式再给 `tau0` / `kind` 也可以，但必须与来源一致，矛盾的追加
+被 `422 rejected` 拒绝、不落批次）。每批仍各自走数据入参检查
+（缺项、非有限数、最短长度），tau0 相关检查不在每批重复。
+
+```bash
+curl -X POST .../sources -d '{"kind":"frequency","tau0":1}'
+# 201 { id, status:"ok", batchCount:0, curveStatus:"insufficient_data", ... }
+
+curl -X POST .../sources/1/batches -d '{"samples":[...第 1 批...]}'
+curl -X POST .../sources/1/batches -d '{"samples":[...第 2 批...]}'
+curl .../sources/1            # 联合全文（mList / points / 噪声标签）
+curl .../sources/1/summary    # 仅摘要
+```
+
+### 跨界滑动块
+
+联合估计在“所有成功批次首尾相连”的整段序列上做重叠 Allan 滑动。
+只要 τ ≤ 整段 T/3，滑动块就会**横跨批次边界**到两侧取样本——这些
+跨界块不会像“先各算曲线再拼接”那样被漏掉。无残缺段时，联合曲线
+与把全部批次首尾相连一次性 POST 到 `/records` 的结果**逐项精确
+一致**（同一条计算路径），包括同一套 decade τ 网格、T/3 裁剪与
+噪声区段识别。来源能支持的最大平均时间（`mMax` /
+`tauLimitTOver3`）随每批追加动态增长，开来源时不固定。
+
+### 残缺段不制造伪重叠
+
+某批数据本身有问题（含非有限数等）时，**只让这一批失败**
+（`422 failed`，落失败批次），不连累来源内已成功的其它批次；
+但它在时间线上留下等长的**残缺区间**（摘要 `gaps` / `hasGaps` /
+`gapSamples`），绝不悄悄跳过缺口把前后两段接成连续序列——否则会
+在缺口两侧造出并不存在的短平均时间伪重叠。残缺段把时间线切成
+若干纪元，任何滑动项只要触及残缺槽就整条丢弃；长到无法在任一纪元
+内取齐两块的 τ 直接不出现在曲线上。连 `samples` 数组都缺失的失败
+批长度未知，记为纪元屏障（`unknownGaps`），屏障两侧永不相跨。
+
+### 串行追加与持久化
+
+一个来源同一时刻只允许一批追加在处理：并发的第二批得到 `409`
+（`APPEND_IN_PROGRESS`），落盘批次与联合状态在同一 SQLite 事务里
+更新，不会交错写坏或把同一批计入两次；严格等上一批响应结束再发的
+串行追加不受影响。来源、批次与当前联合状态均落盘，服务重启后已
+追加的来源可继续追加，且联合曲线不变量保持。全零数据分批追加时，
+所有合法 τ 上 σ_y 仍精确为 0。
+
+摘要（列表与 `/summary`）只给覆盖长度、批次数、残缺段、mMax 等，
+不含原始 `samples` 与明细 `points`；`GET /sources/:id` 才给全文。
 
 ## 方法约定
 
@@ -105,19 +165,24 @@ docker run --rm -p 3000:3000 -v "$PWD/data:/app/data" clock-stability
 
 ```
 src/
-  estimator.js   重叠 Allan 估计（频率相邻块均值之差 / 相位二阶差分）
-  tauGrid.js     decade τ 网格与 T/3 裁剪
-  noise.js       局部斜率与噪声区段识别（钉死的斜率区间）
-  validation.js  入参检查（缺项、非有限数、τ0、最短长度、kind）
-  synthetic.js   确定性合成噪声（白频率 / 随机游走 / 白相位、PRNG）
-  pipeline.js    提交 → 校验 → 选 τ → 估计 → 识别 → 落盘
-  store.js       进程内 SQLite 记录存取
-  preset.js      预置合成白频率记录装载
-  app.js         HTTP 路由
-  server.js      容器入口
+  estimator.js        重叠 Allan 估计（频率相邻块均值之差 / 相位二阶差分）
+  tauGrid.js          decade τ 网格与 T/3 裁剪
+  noise.js            局部斜率与噪声区段识别（钉死的斜率区间）
+  validation.js       单条入参检查（缺项、非有限数、τ0、最短长度、kind）
+  sourceValidation.js 来源/批次入参检查（tau0·kind 只开来源查一次、矛盾拒绝）
+  sourceEstimator.js  批次时间线拼装与跨界感知的联合估计（残缺段切纪元）
+  sourcePipeline.js   开来源 / 串行追加（追加锁）/ 联合状态重算落盘
+  synthetic.js        确定性合成噪声（白频率 / 随机游走 / 白相位、PRNG）
+  pipeline.js         提交 → 校验 → 选 τ → 估计 → 识别 → 落盘
+  store.js            进程内 SQLite：records / sources / source_batches
+  preset.js           预置合成白频率记录装载
+  app.js              HTTP 路由
+  server.js           容器入口
 test/
-  estimator.test.js  数学/单元测试
-  http.test.js       端到端 HTTP 测试
+  estimator.test.js    数学/单元测试
+  http.test.js         单条记录端到端 HTTP 测试
+  source.test.js       来源联合曲线（对齐/残缺/全零/并发/重启）服务级测试
+  sourceHttp.test.js   来源端到端 HTTP 测试
 ```
 
 ## 入参红线
